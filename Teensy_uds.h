@@ -14,7 +14,7 @@
 #define		ECU_RESET	0x11
 #define		READ_DATA_BY_ID	0x22
 #define		READ_MEM	0x23
-#define		SEC_ACCESS	0x27
+#define		B_SEC_ACCESS	0x27
 #define		ROUTINE_CTRL	0x31
 #define		REQ_DL		0x34
 #define		REQ_UL		0x35
@@ -26,6 +26,12 @@ typedef struct{
 	uint16_t ret_len;
 	uint8_t* ret_data;
 } UDS_ret;
+
+enum UDS_Log{
+	LOG_DISABLED = 0,
+	LOG_TEENSY_CS = 1, // Use the Teensy_CS log facility
+	LOG_SERIAL = 2 // Print to the Serial interface
+};
 
 
 class Teensy_uds
@@ -41,12 +47,22 @@ class Teensy_uds
 		 */
 		int seedkey(uint8_t seed[], uint8_t key[]);
 
+		/*
+		 * Set CANids for reading & writing
+		 */
+		void set_ids(uint16_t read_id, uint16_t write_id); 
+
 		/* UDS funcs */
 
 		/*
 		 * Changes the diagnostic session to mode
 		 */
 		int diag_session(uint8_t mode, uint8_t* ret_data, uint16_t* r_len);
+
+		/*
+		 * Clears the read buffer 
+		 */
+		void clear_read_buf();
 
 		/*
 		 * Reset ECU (send 11 01)
@@ -83,14 +99,6 @@ class Teensy_uds
 		 */
 		void write_can_buffer(uint8_t buf[], uint8_t len);
 
-		/*
-		 *	TODO remove these and move to the glitch target files
-		 */
-		int request_ul_0();
-		int request_ul_1();
-		int read_mem_0();
-		int read_mem_1();
-
 
 		/*
 		 * TODO add encrypted / compressed possibly
@@ -113,10 +121,15 @@ class Teensy_uds
 		/*
 		 * Transfer data blocks 
 		 */
+		void get_data();
+		/*
+		 * For online transfer data (big firmware images)
+		 */
+		int transfer_data(uint8_t* ret_data, uint16_t* r_len);
 		int transfer_data(const uint8_t* data, const uint16_t len, uint8_t* ret_data, uint16_t* r_len);
 		int transfer_exit(uint8_t* ret_data, uint16_t* r_len);
 
-		void set_log_enabled(bool log_enabled){
+		void set_log_enabled(UDS_Log log_enabled){
 			this->log_enabled = log_enabled;	
 		};
 
@@ -127,8 +140,11 @@ class Teensy_uds
 		uint16_t read_id;
 		ISOTP_data w_config;
 
-		bool log_enabled = 0;
+		UDS_Log log_enabled = LOG_DISABLED;
 
+		void print_msg(uint32_t can_id, uint16_t len, uint8_t data[]);
+
+		uint8_t tf_data_seq = 1;
 };
 
 
