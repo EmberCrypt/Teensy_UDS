@@ -21,6 +21,10 @@ uint8_t diag_reply[DIAG_REPLY_LEN];
 uint32_t can_rx_id = 0;
 int read_len = 0;
 
+/*
+#define Q_SIZE	0x20
+Queue<ret_data> rx_queue = Queue<ret_data>(Q_SIZE);
+*/
 
 void Teensy_uds::print_msg(uint32_t can_id, uint16_t len, uint8_t data[]){
 	char out_buf[0x8000], *put = out_buf;
@@ -46,7 +50,15 @@ void can_msg_read(const ISOTP_data &config, const uint8_t *buf){
 }
 
 
-void Teensy_uds::clear_read_buf(){
+void pure_canshniff(const CAN_message_t &msg) {
+	memcpy(diag_reply, msg.buf, msg.len);
+	can_rx_id = msg.id;
+	read_len = msg.len;
+}
+
+
+
+void Teensy_uds::clear_read_queue(){
 	memset(diag_reply, 0, DIAG_REPLY_LEN);
 	read_len = 0;
 }
@@ -56,7 +68,7 @@ void Teensy_uds::diag_write(const uint8_t* buf, const uint16_t len){
 	if(this->log_enabled){
 		print_msg(this->write_id, len, buf);
 	}
-	this->clear_read_buf();
+	this->clear_read_queue();
 	tp_comms.write(this->w_config, buf, len);
 }
 
@@ -64,9 +76,8 @@ void Teensy_uds::diag_write(const uint8_t* buf, const uint16_t len){
  * Warning - blocks for timeout_mus until message received 
  * Reply: the length of the message read
 */
-int Teensy_uds::diag_read(uint8_t *read_buf, long timeout_mus){	
+int Teensy_uds::diag_read(UDS_Ret_Data* ret_data, long timeout_mus){	
 	uint32_t begin_t;
-	int n_attempts = 0;
 	begin_t = micros();
 	while(diag_reply[0] == 0 && micros() < begin_t + timeout_mus){
 		delayMicroseconds(1000);
@@ -80,14 +91,12 @@ int Teensy_uds::diag_read(uint8_t *read_buf, long timeout_mus){
 			timeout_mus = 5000000;
 		}
 	}
-	/* If delay message received 
-	while(diag_reply[0] == 0x7f && diag_reply[2] == 0x78){
-		delayMicroseconds(1000);
-	}
-	*/
-	memcpy(read_buf, diag_reply, read_len);
-	if(this->log_enabled && read_len > 0){
+
+	if(read_len > 0){
 		print_msg(can_rx_id, read_len, diag_reply);
+		memcpy(ret_data->data, diag_reply, read_len);
+		ret_data->len = read_len;
+		ret_data->rcv_id = can_rx_id;
 	}
 	return read_len;
 }
@@ -100,6 +109,8 @@ void Teensy_uds::set_ids(uint16_t read_id, uint16_t write_id){
 	this->read_id = read_id;
 	this->w_config =  {.id = write_id, .flags = {.extended = 0, .usePadding = 1, .separation_uS = 1}, .len = 8, .blockSize = 0, .flow_control_type = 0, .separation_time = 1}; // TODO possibly put separation time as an argument to this function
 	tp_comms.setWriteID(this->write_id);
+	can_bus.setFIFOFilter(REJECT_ALL);
+	can_bus.setFIFOFilter(0, this->read_id, STD);
 
 }
 
@@ -110,7 +121,7 @@ Teensy_uds::Teensy_uds(uint16_t write_id, uint16_t read_id){
 	this->read_id = read_id;
 	this->w_config =  {.id = write_id, .flags = {.extended = 0, .usePadding = 1, .separation_uS = 1}, .len = 8, .blockSize = 0, .flow_control_type = 0, .separation_time = 1}; // TODO possibly put separation time as an argument to this function
 
-	this->timeout_mus = 2000000;
+	this->timeout_mus = 20000000;
 
 }
 
@@ -127,18 +138,23 @@ void Teensy_uds::init_can(int baud)
 	can_bus.enableFIFOInterrupt();
 	can_bus.setFIFOFilter(REJECT_ALL);
 	can_bus.setFIFOFilter(0, this->read_id, STD);
-	//can_bus.setFIFOFilter(1, 0x7df, STD); // TODO hardcoded	
 	//can_bus.setFIFOFilter(ACCEPT_ALL);
+
+
+	if(this->mode == MODE_CAN){
+		can_bus.onReceive(pure_canshniff);
+	}
+	else{
+		tp_comms.begin();
+		tp_comms.setWriteBus(&can_bus); 
+		tp_comms.onReceive(can_msg_read); 
+		tp_comms.setWriteID(this->write_id);
+	}
 	
-	tp_comms.begin();
-	tp_comms.setWriteBus(&can_bus); 
-	tp_comms.onReceive(can_msg_read); 
-	tp_comms.setWriteID(this->write_id);
 
 	/*
 	 * Set up the CAN_msg for glitching
 	 */
-	msg.id = this->write_id;
 	msg.len = 8;
 	msg.flags.extended = 0;
 	msg.flags.remote   = 0;
@@ -148,14 +164,13 @@ void Teensy_uds::init_can(int baud)
 
 
 /* Returns 0 if successfull, otherwise the error code */
-int Teensy_uds::uds_req(const uint8_t* buf, const uint16_t len, uint8_t* read_buf, uint16_t* r_len){
-	int n_attempts = 1;
+int Teensy_uds::uds_req(const uint8_t* buf, const uint16_t len, UDS_Ret_Data* r){
 	this->diag_write(buf, len);
-	*r_len = this->diag_read(read_buf, this->timeout_mus);
+	r->len = this->diag_read(r, this->timeout_mus);
 	/* 
 	 * If UDS request successful 
 	 */
-	if(read_buf[0] == buf[0] + 0x40){
+	if(r->data[0] == buf[0] + 0x40){
 		return 0;
 	}
 	return -1;
@@ -163,55 +178,55 @@ int Teensy_uds::uds_req(const uint8_t* buf, const uint16_t len, uint8_t* read_bu
 
 
 
-int Teensy_uds::routine_control(uint16_t routine_id, uint8_t data[], uint16_t data_len, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::routine_control(uint16_t routine_id, uint8_t data[], uint16_t data_len, UDS_Ret_Data* r){
 	int ret;
 	// TODO start routine, check routine, (2, 3)...
 	uint8_t RTC_CTRL[0x100] = {ROUTINE_CTRL, 0x01, routine_id >> 8, routine_id & 0xff};
 	memcpy(RTC_CTRL + 4, data, data_len);
-	ret = this->uds_req(RTC_CTRL, 4 + data_len, ret_data, r_len);
+	ret = this->uds_req(RTC_CTRL, 4 + data_len, r);
 	return ret;
 }
 
 
-int Teensy_uds::diag_session(uint8_t mode, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::diag_session(uint8_t mode, UDS_Ret_Data* r){
 	uint8_t session_req[0x10] = {DIAG_MODE, mode};
-	return this->uds_req(session_req, 2, ret_data, r_len);
+	return this->uds_req(session_req, 2, r);
 }
 
 
 
-int Teensy_uds::sec_access_req(uint8_t level, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::sec_access_req(uint8_t level, UDS_Ret_Data* r){
 	uint8_t SEC_REQ[] = {B_SEC_ACCESS, level};
-	return this->uds_req(SEC_REQ, 2, ret_data, r_len);
+	return this->uds_req(SEC_REQ, 2, r);
 }
 
-int Teensy_uds::sec_access(uint8_t level, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::sec_access(uint8_t level, UDS_Ret_Data* r){
 	uint8_t SEC_REQ[] = {B_SEC_ACCESS, level};
 	uint8_t SEC_RESP[0x100] = {B_SEC_ACCESS, level + 1}; // TODO potential buffer overflow
 	int ret, key_len = 0;
-	ret = this->uds_req(SEC_REQ, 2, ret_data, r_len);	
+	ret = this->uds_req(SEC_REQ, 2, r);	
 	if(ret != 0){
 		return ret;
 	}
-	key_len = this->seedkey(ret_data + 2, SEC_RESP + 2);	
-	return this->uds_req(SEC_RESP, 2 + key_len, ret_data, r_len);
+	key_len = this->seedkey(r->data + 2, SEC_RESP + 2);	
+	return this->uds_req(SEC_RESP, 2 + key_len, r);
 
 }
 
-int Teensy_uds::sec_access_resp(uint8_t level, uint8_t* key_reply, int key_len, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::sec_access_resp(uint8_t level, uint8_t* key_reply, int key_len, UDS_Ret_Data* r){
 	uint8_t SEC_RESP[0x20] = {B_SEC_ACCESS, level};
 	memcpy(SEC_RESP + 2, key_reply, key_len);
-	return this->uds_req(SEC_RESP, 2 + key_len, ret_data, r_len);
+	return this->uds_req(SEC_RESP, 2 + key_len, r);
 }
 
-int Teensy_uds::read_data_by_id(uint16_t id, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::read_data_by_id(uint16_t id, UDS_Ret_Data* r){
 	uint8_t READ_BY_ID[] = {READ_DATA_BY_ID, ((uint8_t) (id >> 8) & 0xff), (uint8_t) id & 0xff};
-	return this->uds_req(READ_BY_ID, 3, ret_data, r_len);
+	return this->uds_req(READ_BY_ID, 3, r);
 }
 
 
 
-int Teensy_uds::request_ul(uint8_t comp_enc_b, uint8_t addr_size, uint32_t addr_st, uint32_t addr_e, uint8_t* ret_data, uint16_t* ret_len){
+int Teensy_uds::request_ul(uint8_t comp_enc_b, uint8_t addr_size, uint32_t addr_st, uint32_t addr_e, UDS_Ret_Data* r){
 	uint8_t REQUEST_UL[0xb] = {REQ_UL, comp_enc_b, addr_size};
 	int idx = 3;
 	// First add the start addr
@@ -222,16 +237,16 @@ int Teensy_uds::request_ul(uint8_t comp_enc_b, uint8_t addr_size, uint32_t addr_
 	for(int i = (addr_size & 0x0f) - 1; i >= 0; --i){
 		REQUEST_UL[idx++] = (addr_e >> (i * 8)) & 0xff;
 	}
-	return this->uds_req(REQUEST_UL, 0xb, ret_data, ret_len);
+	return this->uds_req(REQUEST_UL, 0xb, r);
 
 }
 
-int Teensy_uds::reset_ecu(uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::reset_ecu(UDS_Ret_Data* r){
 	uint8_t reset_req[] = {ECU_RESET, 0x01};
-	return this->uds_req(reset_req, 2, ret_data, r_len);
+	return this->uds_req(reset_req, 2, r);
 }
 
-int Teensy_uds::req_download(uint32_t addr, uint32_t size, uint8_t n_addr, uint8_t n_size, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::req_download(uint32_t addr, uint32_t size, uint8_t n_addr, uint8_t n_size, UDS_Ret_Data* r){
 	uint8_t download_req[0x20] = {REQ_DL, 0x00};
 	download_req[2] = ((n_addr & 0xf) << 4) | (n_size & 0xf);
 	for(int i = 0; i < n_addr; ++i){
@@ -241,7 +256,7 @@ int Teensy_uds::req_download(uint32_t addr, uint32_t size, uint8_t n_addr, uint8
 		download_req[3 + n_addr + i] = size >> ((n_size - 1 -i) * 8);
 	}
 	tf_data_seq = 1;
-	return this->uds_req(download_req, 3 + n_addr + n_size, ret_data, r_len);
+	return this->uds_req(download_req, 3 + n_addr + n_size, r);
 }
 
 
@@ -251,7 +266,7 @@ int Teensy_uds::req_download(uint32_t addr, uint32_t size, uint8_t n_addr, uint8
  * 
  * TODO in / out 
  */
-int Teensy_uds::transfer_data(const uint8_t* data, const uint16_t len, uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::transfer_data(const uint8_t* data, const uint16_t len, UDS_Ret_Data* r){
 	uint8_t transfer_req[0x1000] = {TF_DATA, tf_data_seq};
 	uint16_t MAX_BLOCK_LEN = 0xfff; // TODO set this at request download 
 	uint16_t len_orig = len, len_tot = len;
@@ -260,9 +275,9 @@ int Teensy_uds::transfer_data(const uint8_t* data, const uint16_t len, uint8_t* 
 	while(len_transferred < len_orig){
 		uint16_t block_len = (len_tot > MAX_BLOCK_LEN - 2) ? MAX_BLOCK_LEN - 2: len_tot;
 		memcpy(transfer_req + 2, data + len_transferred, block_len);	
-		int ret = this->uds_req(transfer_req, block_len + 2, ret_data, r_len);
+		int ret = this->uds_req(transfer_req, block_len + 2, r);
 		if(ret != 0)
-			return -1;
+			return ret;
 		transfer_req[1] = ++tf_data_seq;
 		len_transferred += block_len;
 		len_tot -= block_len;
@@ -271,17 +286,22 @@ int Teensy_uds::transfer_data(const uint8_t* data, const uint16_t len, uint8_t* 
 
 }
 
-int Teensy_uds::transfer_exit(uint8_t* ret_data, uint16_t* r_len){
+int Teensy_uds::transfer_exit(UDS_Ret_Data* r){
 	// TODO can be 37 or 37 01 depending on ECU
 	uint8_t exit_req[0x2] = {TF_EXIT, 0x01}; 
-	return this->uds_req(exit_req, 1, ret_data, r_len);
+	return this->uds_req(exit_req, 1, r);
 }
 
-void Teensy_uds::write_can_buffer(uint8_t buf[], uint8_t len){
-	memset(diag_reply, 0, 0x20);
+int Teensy_uds::write_can_buffer(uint8_t buf[], uint8_t len){
+	msg.id = this->write_id;
+	print_msg(msg.id, len, buf);
 
-	memcpy(msg.buf, buf, len);
-	can_bus.write(msg);
+	if (len <= 8){
+		memcpy(msg.buf, buf, len);
+		can_bus.write(msg);
+		return 0;
+	}
+	return -1;
 }
 
 
